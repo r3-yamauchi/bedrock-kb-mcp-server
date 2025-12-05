@@ -40,6 +40,8 @@ from bedrock_kb_mcp_server.types import (
     RetrieveResponseDict,
     S3UploadResponseDict,
     S3DocumentListResponseDict,
+    S3BucketCreateResponseDict,
+    IAMRoleCreateResponseDict,
 )
 from bedrock_kb_mcp_server.utils import (
     validate_aws_credentials,
@@ -110,6 +112,7 @@ def create_knowledge_base(
     storage_type: str = "S3",
     bucket_arn: str = "",
     embedding_model_arn: str = "",
+    region: str = "us-east-1",
     # パーシング設定（オプション）
     parsing_strategy: str = "",
     parsing_model_arn: str = "",
@@ -141,6 +144,9 @@ def create_knowledge_base(
             - ARN形式: "arn:aws:s3:::BUCKET_NAME"
             - URI形式: "s3://BUCKET_NAME" または "s3://BUCKET_NAME/path"
             S3_VECTORSの場合はベクトルバケットARNまたはURIを指定
+        region: Knowledge Baseを作成する先のリージョン（デフォルト: "us-east-1"）
+            例: "us-east-1", "ap-northeast-1"
+            注意: Knowledge Baseのリージョンは作成時に決定され、後から変更できません
         embedding_model_arn: 埋め込みモデルのARN（S3_VECTORSタイプの場合必須）
             形式: "arn:aws:bedrock:REGION::foundation-model/MODEL_ID"
             
@@ -388,8 +394,14 @@ def create_knowledge_base(
     if request.vector_ingestion_configuration:
         vector_ingestion_config_dict = request.vector_ingestion_configuration.to_api_dict()
     
+    # リージョンを正規化（前後の空白を削除、空文字列の場合はus-east-1を使用）
+    region_cleaned = region.strip() if region else "us-east-1"
+    
+    # 指定されたリージョンで一時的にクライアントを作成
+    kb_client = BedrockKBClient(region=region_cleaned)
+    
     # Bedrockクライアントを使用してKnowledge Baseを作成
-    result = bedrock_client.create_knowledge_base(
+    result = kb_client.create_knowledge_base(
         name=request.name,
         description=request.description,
         role_arn=request.role_arn,
@@ -1002,6 +1014,190 @@ def list_s3_documents(bucket_name: str, prefix: str = "") -> S3DocumentListRespo
         "prefix": prefix_cleaned,
         "documents": documents,
     }
+
+
+@mcp.tool()  # MCPツールとして公開
+@handle_errors  # エラーハンドリングデコレータを適用
+def create_s3_bucket(
+    bucket_name: str,
+    region: str = "us-east-1",
+) -> S3BucketCreateResponseDict:
+    """
+    S3バケットを新規作成します。
+    
+    バケット名は以下のルールに従う必要があります:
+    - 3文字以上63文字以下
+    - 小文字、数字、ハイフン（-）、ピリオド（.）のみ使用可能
+    - 先頭と末尾は小文字または数字である必要がある
+    - 連続するハイフンやピリオドは使用不可
+    - IPアドレス形式（例: 192.168.1.1）は使用不可
+    - バケット名はグローバルに一意である必要があります
+    
+    注意: セキュリティ上の理由から、パブリックアクセスブロックは常に有効化されます。
+
+    Args:
+        bucket_name: 作成するS3バケット名（必須）
+            例: "my-documents-bucket"
+        region: バケットを作成するリージョン（デフォルト: "us-east-1"）
+            例: "us-east-1", "ap-northeast-1"
+            注意: us-east-1リージョンの場合、LocationConstraintは指定しません
+
+    Returns:
+        S3BucketCreateResponseDict: バケット作成結果
+            - bucket_name: 作成されたバケット名
+            - region: バケットが作成されたリージョン
+            - arn: バケットのARN（arn:aws:s3:::bucket-name形式）
+            - status: 作成ステータス（"created"）
+    
+    Raises:
+        ValueError: bucket_nameが空の場合、またはバケット名が無効な形式の場合
+        ClientError: AWS API呼び出しが失敗した場合
+            例: バケット名が既に使用されている、権限がないなど
+    
+    Example:
+        # 基本的なバケット作成（デフォルトリージョン、パブリックアクセスブロック有効）
+        create_s3_bucket("my-documents-bucket")
+        
+        # 特定のリージョンにバケットを作成
+        create_s3_bucket("my-documents-bucket", region="ap-northeast-1")
+    
+    Note:
+        - バケットの作成には数秒かかる場合があります
+        - バケット名が既に使用されている場合、BucketAlreadyOwnedByYouまたはBucketAlreadyExistsエラーが発生します
+        - パブリックアクセスブロック設定は、バケット作成後に自動的に適用されます
+    """
+    # 入力値のバリデーション（共通関数を使用）
+    bucket_name = validate_required_string(bucket_name, "bucket_name")
+    
+    # バケット名の基本的なバリデーション
+    # AWS S3のバケット名ルールに従う必要があります
+    if len(bucket_name) < 3 or len(bucket_name) > 63:
+        raise ValueError("bucket_name must be between 3 and 63 characters")
+    
+    # バケット名は小文字、数字、ハイフン、ピリオドのみ使用可能
+    # ただし、IPアドレス形式は使用不可
+    import re
+    if not re.match(r'^[a-z0-9][a-z0-9.-]*[a-z0-9]$', bucket_name):
+        raise ValueError(
+            "bucket_name must start and end with a lowercase letter or number, "
+            "and contain only lowercase letters, numbers, hyphens, and periods"
+        )
+    
+    # 連続するハイフンやピリオドは使用不可
+    if '..' in bucket_name or '--' in bucket_name:
+        raise ValueError("bucket_name cannot contain consecutive periods or hyphens")
+    
+    # IPアドレス形式のチェック（簡易版）
+    # より厳密なチェックが必要な場合は、ipaddressモジュールを使用できます
+    ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+    if re.match(ip_pattern, bucket_name):
+        raise ValueError("bucket_name cannot be in IP address format")
+    
+    # リージョンを正規化（前後の空白を削除、空文字列の場合はus-east-1を使用）
+    region_cleaned = region.strip() if region else "us-east-1"
+    
+    # BedrockクライアントからS3バケットを作成
+    result = bedrock_client.create_s3_bucket(
+        bucket_name=bucket_name,  # 前後の空白は既に削除済み
+        region=region_cleaned,  # 既定値はus-east-1
+    )
+    return result
+
+
+@mcp.tool()  # MCPツールとして公開
+@handle_errors  # エラーハンドリングデコレータを適用
+def create_bedrock_kb_role(
+    role_name: str,
+    region: str = "us-east-1",
+    description: str = "Bedrock Knowledge Base access",
+    max_session_duration: int = 3600,
+) -> IAMRoleCreateResponseDict:
+    """
+    Amazon Bedrock Knowledge Base用のサービスロールを作成します。
+    
+    このツールは、Bedrock Knowledge Baseが使用するIAMロールを作成します。
+    ロールには以下の信頼ポリシーが設定されます:
+    - Service: bedrock.amazonaws.com
+    - Condition: aws:SourceAccountとaws:SourceArnによる制限
+      - aws:SourceAccount: 現在のAWSアカウントID
+      - aws:SourceArn: arn:aws:bedrock:[REGION]:[ACCOUNT_ID]:knowledge-base/*
+
+    Args:
+        role_name: 作成するIAMロールの名前（必須）
+            例: "BedrockKnowledgeBaseRole"
+            注意: ロール名はAWSアカウント内で一意である必要があります
+        region: Knowledge Baseを作成する先のリージョン（デフォルト: "us-east-1"）
+            例: "us-east-1", "ap-northeast-1"
+            注意: 信頼ポリシーのaws:SourceArnにこのリージョンが使用されます
+            このリージョンは、Knowledge Baseを作成する際に指定するリージョンと一致させる必要があります
+        description: ロールの説明（デフォルト: "Bedrock Knowledge Base access"）
+        max_session_duration: 最大セッション時間（秒）（デフォルト: 3600秒 = 1時間）
+            範囲: 3600秒（1時間）から43200秒（12時間）まで
+
+    Returns:
+        IAMRoleCreateResponseDict: ロール作成結果
+            - role_name: 作成されたロール名
+            - role_arn: ロールのARN（arn:aws:iam::ACCOUNT_ID:role/service-role/ROLE_NAME形式）
+            - path: ロールのパス（/service-role/）
+            - status: 作成ステータス（"created"）
+    
+    Raises:
+        ValueError: role_nameが空の場合、またはmax_session_durationが無効な範囲の場合
+        ClientError: AWS API呼び出しが失敗した場合
+            例: ロール名が既に使用されている、権限がないなど
+    
+    Example:
+        # 基本的なロール作成（デフォルトリージョン）
+        create_bedrock_kb_role("BedrockKnowledgeBaseRole")
+        
+        # 特定のリージョン用のロール作成
+        create_bedrock_kb_role("BedrockKnowledgeBaseRole", region="ap-northeast-1")
+        
+        # カスタム説明とセッション時間を指定
+        create_bedrock_kb_role(
+            "MyBedrockRole",
+            description="Custom Bedrock KB role",
+            max_session_duration=7200
+        )
+    
+    Note:
+        - ロールは /service-role/ パスに作成されます
+        - 信頼ポリシーには、現在のAWSアカウントIDとリージョンが自動的に設定されます
+        - ロール作成後、適切な権限ポリシーをアタッチする必要があります
+        - ロール名が既に使用されている場合、EntityAlreadyExistsエラーが発生します
+    """
+    # 入力値のバリデーション（共通関数を使用）
+    role_name = validate_required_string(role_name, "role_name")
+    
+    # ロール名の基本的なバリデーション
+    # IAMロール名のルールに従う必要があります
+    if len(role_name) < 1 or len(role_name) > 64:
+        raise ValueError("role_name must be between 1 and 64 characters")
+    
+    # ロール名は英数字、ハイフン、アンダースコア、ピリオドのみ使用可能
+    import re
+    if not re.match(r'^[\w+=,.@-]+$', role_name):
+        raise ValueError(
+            "role_name must contain only alphanumeric characters, hyphens, "
+            "underscores, periods, plus signs, equals signs, commas, and @ symbols"
+        )
+    
+    # max_session_durationのバリデーション
+    # IAMの制限: 3600秒（1時間）から43200秒（12時間）まで
+    if max_session_duration < 3600 or max_session_duration > 43200:
+        raise ValueError("max_session_duration must be between 3600 and 43200 seconds")
+    
+    # リージョンを正規化（前後の空白を削除、空文字列の場合はus-east-1を使用）
+    region_cleaned = region.strip() if region else "us-east-1"
+    
+    # BedrockクライアントからIAMロールを作成
+    result = bedrock_client.create_bedrock_kb_role(
+        role_name=role_name,  # 前後の空白は既に削除済み
+        region=region_cleaned,  # 既定値はus-east-1
+        description=description,
+        max_session_duration=max_session_duration,
+    )
+    return result
 
 
 def main():

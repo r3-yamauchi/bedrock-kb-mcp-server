@@ -69,10 +69,27 @@ class S3DocumentListResponseDict(TypedDict):
     documents: List[Dict[str, Any]]
 
 
+class S3BucketCreateResponseDict(TypedDict):
+    """S3バケット作成のレスポンス型"""
+    bucket_name: str
+    region: str
+    arn: str
+    status: str
+
+
+class IAMRoleCreateResponseDict(TypedDict):
+    """IAMロール作成のレスポンス型"""
+    role_name: str
+    role_arn: str
+    path: str
+    status: str
+
+
 class ErrorResponseDict(TypedDict):
     """エラーレスポンスの型"""
     error: str
     code: str
     details: Optional[str]
     request_id: Optional[str]
+
 

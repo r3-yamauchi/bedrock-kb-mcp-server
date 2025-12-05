@@ -19,6 +19,8 @@ from bedrock_kb_mcp_server.types import (
     IngestionJobResponseDict,
     RetrieveResponseDict,
     S3UploadResponseDict,
+    S3BucketCreateResponseDict,
+    IAMRoleCreateResponseDict,
 )
 
 # このモジュール用のロガーを取得
@@ -33,7 +35,7 @@ class BedrockKBClient:
     AWS Bedrock API操作を提供します。
     """
 
-    def __init__(self):
+    def __init__(self, region: Optional[str] = None):
         """
         Bedrockクライアントを初期化します。
         
@@ -42,13 +44,16 @@ class BedrockKBClient:
         - bedrock-agent-runtime: RAGクエリ実行用
         - s3: S3ドキュメント管理用
         
+        Args:
+            region: AWSリージョン（オプション）
+                   指定しない場合は、環境変数AWS_REGIONから取得されます（デフォルト: us-east-1）
+        
         Environment Variables:
             AWS_REGION: AWSリージョン（デフォルト: us-east-1）
         """
-        # 環境変数からリージョンを取得（デフォルト: us-east-1）
-        # AWS_REGION環境変数が設定されていない場合は、us-east-1が使用されます
+        # リージョンを取得（引数 > 環境変数 > デフォルト値の優先順位）
         # 注意: リージョンはKnowledge Baseの作成時に決定され、後から変更できません
-        self.region = os.getenv("AWS_REGION", "us-east-1")
+        self.region = region if region else os.getenv("AWS_REGION", "us-east-1")
         
         # AWSクライアント設定（リトライとタイムアウト設定）
         # adaptiveモードは、エラーの種類に応じて自動的にリトライ間隔を調整します
@@ -86,6 +91,14 @@ class BedrockKBClient:
         self.s3_client = boto3.client(
             "s3",  # Amazon S3サービス
             region_name=self.region,  # 指定されたリージョン
+            config=config,  # リトライとタイムアウト設定を適用
+        )
+        
+        # IAMクライアント（IAMロール管理用）
+        # このクライアントは、Bedrock Knowledge Base用のIAMロール作成に使用されます
+        # 注意: IAMはグローバルサービスですが、リージョン指定は無視されます
+        self.iam_client = boto3.client(
+            "iam",  # AWS Identity and Access Managementサービス
             config=config,  # リトライとタイムアウト設定を適用
         )
         
@@ -321,41 +334,6 @@ class BedrockKBClient:
             logger.error(f"Error updating knowledge base {knowledge_base_id}: {e}")
             raise
 
-    def delete_knowledge_base(self, knowledge_base_id: str) -> Dict[str, Any]:
-        """
-        Knowledge Baseを削除します。
-        
-        注意: この操作は取り消せません。Knowledge Baseとその関連リソースが
-        完全に削除されます。
-
-        Args:
-            knowledge_base_id: 削除対象のKnowledge BaseのID
-
-        Returns:
-            Dict[str, Any]: 削除ステータス
-                - status: 削除ステータス（"deleted"）
-                - knowledge_base_id: 削除されたKnowledge BaseのID
-        
-        Raises:
-            ClientError: AWS API呼び出しが失敗した場合
-        
-        Warning:
-            この操作は永続的です。削除されたKnowledge Baseは復元できません。
-            関連するデータソースや取り込みジョブの履歴も削除される場合があります。
-        """
-        try:
-            # AWS Bedrock APIを呼び出してKnowledge Baseを削除
-            self.bedrock_agent.delete_knowledge_base(knowledgeBaseId=knowledge_base_id)
-            
-            # 削除成功をログに記録
-            logger.info(f"Deleted knowledge base: {knowledge_base_id}")
-            
-            # 削除結果を返す
-            return {"status": "deleted", "knowledge_base_id": knowledge_base_id}
-        except ClientError as e:
-            logger.error(f"Error deleting knowledge base {knowledge_base_id}: {e}")
-            raise
-
     def create_data_source(
         self,
         knowledge_base_id: str,
@@ -456,45 +434,6 @@ class BedrockKBClient:
             return data_sources
         except ClientError as e:
             logger.error(f"Error listing data sources for KB {knowledge_base_id}: {e}")
-            raise
-
-    def delete_data_source(
-        self, knowledge_base_id: str, data_source_id: str
-    ) -> Dict[str, Any]:
-        """
-        データソースを削除します。
-        
-        注意: この操作は取り消せません。データソースが削除されると、
-        そのデータソースからのデータ取り込みは行われなくなります。
-
-        Args:
-            knowledge_base_id: Knowledge BaseのID
-            data_source_id: 削除対象のデータソースのID
-
-        Returns:
-            Dict[str, Any]: 削除ステータス
-                - status: 削除ステータス（"deleted"）
-                - data_source_id: 削除されたデータソースのID
-        
-        Raises:
-            ClientError: AWS API呼び出しが失敗した場合
-        
-        Warning:
-            この操作は永続的です。削除されたデータソースは復元できません。
-        """
-        try:
-            # AWS Bedrock APIを呼び出してデータソースを削除
-            self.bedrock_agent.delete_data_source(
-                knowledgeBaseId=knowledge_base_id, dataSourceId=data_source_id
-            )
-            
-            # 削除成功をログに記録
-            logger.info(f"Deleted data source {data_source_id} from KB {knowledge_base_id}")
-            
-            # 削除結果を返す
-            return {"status": "deleted", "data_source_id": data_source_id}
-        except ClientError as e:
-            logger.error(f"Error deleting data source {data_source_id}: {e}")
             raise
 
     def start_ingestion_job(
@@ -755,5 +694,189 @@ class BedrockKBClient:
             return documents
         except ClientError as e:
             logger.error(f"Error listing S3 documents: {e}")
+            raise
+
+    def create_s3_bucket(
+        self,
+        bucket_name: str,
+        region: str = "us-east-1",
+    ) -> S3BucketCreateResponseDict:
+        """
+        S3バケットを新規作成します。
+        
+        バケット名は以下のルールに従う必要があります:
+        - 3文字以上63文字以下
+        - 小文字、数字、ハイフン（-）、ピリオド（.）のみ使用可能
+        - 先頭と末尾は小文字または数字である必要がある
+        - 連続するハイフンやピリオドは使用不可
+        - IPアドレス形式（例: 192.168.1.1）は使用不可
+        
+        注意: セキュリティ上の理由から、パブリックアクセスブロックは常に有効化されます。
+        
+        Args:
+            bucket_name: 作成するS3バケット名（必須）
+            region: バケットを作成するリージョン（デフォルト: "us-east-1"）
+                    注意: us-east-1リージョンの場合、LocationConstraintは指定しません
+        
+        Returns:
+            S3BucketCreateResponseDict: バケット作成結果
+                - bucket_name: 作成されたバケット名
+                - region: バケットが作成されたリージョン
+                - arn: バケットのARN（arn:aws:s3:::bucket-name形式）
+                - status: 作成ステータス（"created"）
+        
+        Raises:
+            ClientError: AWS API呼び出しが失敗した場合
+                例: バケット名が既に使用されている、権限がない、バケット名が無効など
+        
+        Note:
+            - バケット名はグローバルに一意である必要があります
+            - バケットの作成には数秒かかる場合があります
+            - パブリックアクセスブロック設定は、バケット作成後に自動的に適用されます
+        """
+        try:
+            # リージョンを使用（既定値はus-east-1）
+            bucket_region = region
+            
+            # バケット作成パラメータを準備
+            create_bucket_params = {"Bucket": bucket_name}
+            
+            # us-east-1以外のリージョンの場合、LocationConstraintを指定
+            # us-east-1はデフォルトリージョンのため、LocationConstraintを指定するとエラーになります
+            if bucket_region != "us-east-1":
+                create_bucket_params["CreateBucketConfiguration"] = {
+                    "LocationConstraint": bucket_region
+                }
+            
+            # バケットを作成
+            # 注意: バケット名が既に使用されている場合、BucketAlreadyOwnedByYouエラーが発生します
+            # バケット名が他のアカウントで使用されている場合、BucketAlreadyExistsエラーが発生します
+            self.s3_client.create_bucket(**create_bucket_params)
+            
+            # パブリックアクセスブロック設定を適用（セキュリティ上の理由から常に有効化）
+            self.s3_client.put_public_access_block(
+                Bucket=bucket_name,
+                PublicAccessBlockConfiguration={
+                    "BlockPublicAcls": True,
+                    "IgnorePublicAcls": True,
+                    "BlockPublicPolicy": True,
+                    "RestrictPublicBuckets": True,
+                },
+            )
+            
+            # バケットARNを構築
+            bucket_arn = f"arn:aws:s3:::{bucket_name}"
+            
+            # バケット作成成功をログに記録
+            logger.info(f"Created S3 bucket: {bucket_name} in region: {bucket_region}")
+            
+            # 作成結果を返す
+            return {
+                "bucket_name": bucket_name,
+                "region": bucket_region,
+                "arn": bucket_arn,
+                "status": "created",
+            }
+        except ClientError as e:
+            logger.error(f"Error creating S3 bucket: {e}")
+            raise
+
+    def create_bedrock_kb_role(
+        self,
+        role_name: str,
+        region: str = "us-east-1",
+        description: str = "Bedrock Knowledge Base access",
+        max_session_duration: int = 3600,
+    ) -> IAMRoleCreateResponseDict:
+        """
+        Amazon Bedrock Knowledge Base用のサービスロールを作成します。
+        
+        このメソッドは、Bedrock Knowledge Baseが使用するIAMロールを作成します。
+        ロールには以下の信頼ポリシーが設定されます:
+        - Service: bedrock.amazonaws.com
+        - Condition: aws:SourceAccountとaws:SourceArnによる制限
+        
+        Args:
+            role_name: 作成するIAMロールの名前（必須）
+                例: "BedrockKnowledgeBaseRole"
+            region: Knowledge Baseを作成する先のリージョン（デフォルト: "us-east-1"）
+                    このリージョンは、Knowledge Baseを作成する際に指定するリージョンと一致させる必要があります
+            description: ロールの説明（デフォルト: "Bedrock Knowledge Base access"）
+            max_session_duration: 最大セッション時間（秒）（デフォルト: 3600秒 = 1時間）
+        
+        Returns:
+            IAMRoleCreateResponseDict: ロール作成結果
+                - role_name: 作成されたロール名
+                - role_arn: ロールのARN（arn:aws:iam::ACCOUNT_ID:role/service-role/ROLE_NAME形式）
+                - path: ロールのパス（/service-role/）
+                - status: 作成ステータス（"created"）
+        
+        Raises:
+            ClientError: AWS API呼び出しが失敗した場合
+                例: ロール名が既に使用されている、権限がないなど
+        
+        Note:
+            - ロール名はAWSアカウント内で一意である必要があります
+            - ロールは /service-role/ パスに作成されます
+            - 信頼ポリシーには、現在のAWSアカウントIDとリージョンが自動的に設定されます
+        """
+        import json
+        from bedrock_kb_mcp_server.utils import get_aws_account_id
+        
+        try:
+            # リージョンを使用（既定値はus-east-1）
+            role_region = region
+            
+            # AWSアカウントIDを取得
+            account_id = get_aws_account_id()
+            
+            # 信頼ポリシー（Trust Policy）を構築
+            # Bedrockサービスがこのロールを引き受けることを許可します
+            trust_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {
+                            "Service": "bedrock.amazonaws.com"
+                        },
+                        "Action": "sts:AssumeRole",
+                        "Condition": {
+                            "StringEquals": {
+                                "aws:SourceAccount": account_id
+                            },
+                            "ArnLike": {
+                                "aws:SourceArn": f"arn:aws:bedrock:{role_region}:{account_id}:knowledge-base/*"
+                            }
+                        }
+                    }
+                ]
+            }
+            
+            # IAMロールを作成
+            # パス /service-role/ を使用して、サービスロールとして識別しやすくします
+            response = self.iam_client.create_role(
+                RoleName=role_name,
+                AssumeRolePolicyDocument=json.dumps(trust_policy),
+                Path="/service-role/",
+                Description=description,
+                MaxSessionDuration=max_session_duration,
+            )
+            
+            # ロールARNを取得
+            role_arn = response["Role"]["Arn"]
+            
+            # ロール作成成功をログに記録
+            logger.info(f"Created IAM role: {role_name} (ARN: {role_arn})")
+            
+            # 作成結果を返す
+            return {
+                "role_name": role_name,
+                "role_arn": role_arn,
+                "path": "/service-role/",
+                "status": "created",
+            }
+        except ClientError as e:
+            logger.error(f"Error creating IAM role: {e}")
             raise
 
