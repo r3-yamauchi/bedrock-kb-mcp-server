@@ -1,0 +1,63 @@
+[project]
+name = "bedrock-kb-mcp-server"
+version = "0.1.0"
+description = "MCP server for managing Amazon Bedrock Knowledge Bases"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "r3-yamauchi" }
+]
+keywords = ["bedrock", "knowledge-base", "mcp", "aws"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: Japanese",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet",
+]
+
+dependencies = [
+    "fastmcp>=0.1.0",
+    "boto3>=1.26.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+bedrock-kb-mcp-server = "bedrock_kb_mcp_server.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bedrock_kb_mcp_server"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+select = ["E", "F", "W", "I"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
