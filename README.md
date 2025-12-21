@@ -5,12 +5,17 @@ Amazon Bedrock Knowledge Baseを管理するためのMCP（Model Context Protoco
 本プロジェクトでは FastMCPフレームワークを使用して Bedrock Knowledge Base に対する操作と
 RAG（Retrieval-Augmented Generation）機能を提供しています。
 
-
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/r3-yamauchi/bedrock-kb-mcp-server)
 
 ## リポジトリ
 
 https://github.com/r3-yamauchi/bedrock-kb-mcp-server
+
+## 起動方法
+
+```bash
+uvx --from git+https://github.com/r3-yamauchi/bedrock-kb-mcp-server bedrock-kb-mcp-server
+```
 
 ## 主な機能
 
